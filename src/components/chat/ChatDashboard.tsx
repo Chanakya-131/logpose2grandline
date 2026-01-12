@@ -1,5 +1,6 @@
 import { useState, useCallback } from "react";
 import { motion } from "framer-motion";
+import { toast } from "sonner";
 import ChatSidebar, { ChatHistory } from "./ChatSidebar";
 import ChatArea from "./ChatArea";
 import ChatInput from "./ChatInput";
@@ -9,12 +10,105 @@ interface ChatDashboardProps {
   onLogout: () => void;
 }
 
-// Mock responses for demo
-const mockResponses = [
-  "Let's set sail! I've scanned the seas of the internet and found some treasure for you, Captain!\n\nBased on my search, here's what I discovered:\n\n**Key Findings:**\n• The information you're looking for is trending across multiple sources\n• Several experts have weighed in on this topic\n• There are some exciting developments happening right now\n\nWant me to dive deeper into any specific aspect of this? I'm ready to explore further, Nakama!",
-  "Yohohoho! Great question, Captain! After exploring the digital Grand Line, I've brought back some valuable intel!\n\n**Here's what I found:**\n\nThe latest data shows some fascinating trends. Multiple reliable sources confirm this information, and there's been significant activity around this topic recently.\n\n**My Analysis:**\nThis appears to be a hot topic with lots of engagement. The key players in this space are making moves, and there's definitely more to uncover.\n\nShall I continue the voyage and find more details? ⚓",
-  "Gear 5 activated for this search! I've stretched my investigation across the entire internet, and here's the treasure I found!\n\n**Summary:**\nThis is definitely something worth paying attention to. The community is buzzing, and there are multiple perspectives to consider.\n\n**Important Points:**\n• First, the foundational aspects are solid\n• Second, there's growing momentum in this area  \n• Third, experts predict exciting developments ahead\n\nYou've got good instincts asking about this, Captain! Want me to elaborate on any of these points?",
-];
+const CHAT_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
+
+type ChatMsg = { role: "user" | "assistant"; content: string };
+
+async function streamChat({
+  messages,
+  onDelta,
+  onDone,
+  onError,
+}: {
+  messages: ChatMsg[];
+  onDelta: (deltaText: string) => void;
+  onDone: () => void;
+  onError: (error: string) => void;
+}) {
+  try {
+    const resp = await fetch(CHAT_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+      },
+      body: JSON.stringify({ messages }),
+    });
+
+    if (resp.status === 429) {
+      onError("Rate limit exceeded. The seas are busy, Captain! Try again in a moment.");
+      return;
+    }
+    if (resp.status === 402) {
+      onError("Payment required. Need more treasure to continue the voyage!");
+      return;
+    }
+    if (!resp.ok || !resp.body) {
+      onError("Failed to connect to the AI. The Grand Line is stormy right now!");
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let textBuffer = "";
+    let streamDone = false;
+
+    while (!streamDone) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      textBuffer += decoder.decode(value, { stream: true });
+
+      let newlineIndex: number;
+      while ((newlineIndex = textBuffer.indexOf("\n")) !== -1) {
+        let line = textBuffer.slice(0, newlineIndex);
+        textBuffer = textBuffer.slice(newlineIndex + 1);
+
+        if (line.endsWith("\r")) line = line.slice(0, -1);
+        if (line.startsWith(":") || line.trim() === "") continue;
+        if (!line.startsWith("data: ")) continue;
+
+        const jsonStr = line.slice(6).trim();
+        if (jsonStr === "[DONE]") {
+          streamDone = true;
+          break;
+        }
+
+        try {
+          const parsed = JSON.parse(jsonStr);
+          const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+          if (content) onDelta(content);
+        } catch {
+          textBuffer = line + "\n" + textBuffer;
+          break;
+        }
+      }
+    }
+
+    // Final flush
+    if (textBuffer.trim()) {
+      for (let raw of textBuffer.split("\n")) {
+        if (!raw) continue;
+        if (raw.endsWith("\r")) raw = raw.slice(0, -1);
+        if (raw.startsWith(":") || raw.trim() === "") continue;
+        if (!raw.startsWith("data: ")) continue;
+        const jsonStr = raw.slice(6).trim();
+        if (jsonStr === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(jsonStr);
+          const content = parsed.choices?.[0]?.delta?.content as string | undefined;
+          if (content) onDelta(content);
+        } catch {
+          /* ignore partial leftovers */
+        }
+      }
+    }
+
+    onDone();
+  } catch (e) {
+    console.error("Stream error:", e);
+    onError("Connection lost. The sea kings got in the way!");
+  }
+}
 
 const ChatDashboard = ({ onLogout }: ChatDashboardProps) => {
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -31,7 +125,6 @@ const ChatDashboard = ({ onLogout }: ChatDashboardProps) => {
 
   const handleSelectChat = useCallback((id: string) => {
     setActiveChatId(id);
-    // In a real app, load messages for this chat
   }, []);
 
   const handleDeleteChat = useCallback((id: string) => {
@@ -43,7 +136,6 @@ const ChatDashboard = ({ onLogout }: ChatDashboardProps) => {
   }, [activeChatId]);
 
   const handleSendMessage = useCallback(async (content: string) => {
-    // Add user message
     const userMessage: Message = {
       id: Date.now().toString(),
       role: "user",
@@ -52,7 +144,6 @@ const ChatDashboard = ({ onLogout }: ChatDashboardProps) => {
     };
     setMessages((prev) => [...prev, userMessage]);
 
-    // Create or update chat in history
     if (!activeChatId) {
       const newChatId = Date.now().toString();
       setActiveChatId(newChatId);
@@ -67,7 +158,6 @@ const ChatDashboard = ({ onLogout }: ChatDashboardProps) => {
       ]);
     }
 
-    // Add searching message
     const searchingMessage: Message = {
       id: (Date.now() + 1).toString(),
       role: "assistant",
@@ -78,46 +168,55 @@ const ChatDashboard = ({ onLogout }: ChatDashboardProps) => {
     setMessages((prev) => [...prev, searchingMessage]);
     setIsLoading(true);
 
-    // Simulate search delay
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const assistantMessageId = (Date.now() + 2).toString();
+    let assistantContent = "";
 
-    // Get random response
-    const responseContent = mockResponses[Math.floor(Math.random() * mockResponses.length)];
-
-    // Stream the response
-    const assistantMessage: Message = {
-      id: (Date.now() + 2).toString(),
-      role: "assistant",
-      content: "",
-      sources: [
-        { title: "Wikipedia", url: "https://wikipedia.org" },
-        { title: "Research Paper", url: "https://arxiv.org" },
-        { title: "News Source", url: "https://news.com" },
-      ],
-      timestamp: new Date(),
-    };
+    // Build conversation history for context
+    const conversationHistory: ChatMsg[] = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
+    conversationHistory.push({ role: "user", content });
 
     // Remove searching message and add empty assistant message
     setMessages((prev) => [
       ...prev.filter((m) => !m.isSearching),
-      assistantMessage,
+      {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        timestamp: new Date(),
+      },
     ]);
 
-    // Stream content word by word
-    const words = responseContent.split(" ");
-    for (let i = 0; i < words.length; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === assistantMessage.id
-            ? { ...m, content: words.slice(0, i + 1).join(" ") }
-            : m
-        )
-      );
-    }
-
-    setIsLoading(false);
-  }, [activeChatId]);
+    await streamChat({
+      messages: conversationHistory,
+      onDelta: (chunk) => {
+        assistantContent += chunk;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMessageId
+              ? { ...m, content: assistantContent }
+              : m
+          )
+        );
+      },
+      onDone: () => {
+        setIsLoading(false);
+      },
+      onError: (error) => {
+        toast.error(error);
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantMessageId
+              ? { ...m, content: `⚠️ ${error}` }
+              : m
+          )
+        );
+        setIsLoading(false);
+      },
+    });
+  }, [activeChatId, messages]);
 
   return (
     <motion.div
@@ -126,7 +225,6 @@ const ChatDashboard = ({ onLogout }: ChatDashboardProps) => {
       animate={{ opacity: 1 }}
       transition={{ duration: 0.5 }}
     >
-      {/* Sidebar */}
       <ChatSidebar
         isOpen={sidebarOpen}
         onToggle={() => setSidebarOpen(!sidebarOpen)}
@@ -138,7 +236,6 @@ const ChatDashboard = ({ onLogout }: ChatDashboardProps) => {
         onLogout={onLogout}
       />
 
-      {/* Main chat area */}
       <div className="flex-1 flex flex-col min-w-0">
         <ChatArea messages={messages} />
         <ChatInput onSend={handleSendMessage} isLoading={isLoading} />
